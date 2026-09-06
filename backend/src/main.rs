@@ -52,7 +52,9 @@ use geoip::GeoIpService;
 use geoip_updater::GeoIpUpdater;
 use metrics::MetricsCollector;
 use postgres::PostgresPool;
+use config::ReplayStorage;
 use processing::EventProcessor;
+use session_replay::{MAX_UPLOAD_BODY_BYTES, ReplayCtx, store::SegmentStore};
 use site_config::{RefreshConfig, SiteConfigCache, SiteConfigDataSource, SiteConfigRepository};
 use storage::s3::S3Service;
 use validation::{EventValidator, ValidationConfig};
@@ -245,6 +247,23 @@ async fn main() {
         Err(e) => panic!("Failed to initialize S3 service: {}", e),
     };
 
+    if config.enable_session_replay && config.replay_storage == ReplayStorage::S3 {
+        info!("REPLAY_RETENTION_DAYS applies to ClickHouse data only; expire S3 objects under the 'site/' prefix with a bucket lifecycle rule");
+    }
+
+    // Built only when replay is enabled, so the config assert has already validated
+    // the storage mode for this config.
+    let replay_ctx = config.enable_session_replay.then(|| {
+        let store = match config.replay_storage {
+            ReplayStorage::S3 => SegmentStore::S3(s3_service.clone().expect("asserted by config validation")),
+            ReplayStorage::ClickHouse => SegmentStore::ClickHouse(db.clone()),
+        };
+        Arc::new(ReplayCtx {
+            mode: config.replay_storage,
+            store,
+        })
+    });
+
 	let mut router = Router::new()
 		.route("/health", get(health_check))
 		.route("/event", post(track_event))
@@ -255,12 +274,10 @@ async fn main() {
     if config.enable_session_replay {
         router = router
             .route(
-                "/replay/presign/put",
-                post(session_replay::presign_put_segment),
-            )
-            .route(
-                "/replay/finalize",
-                post(session_replay::finalize_session_replay),
+                "/replay/segment",
+                post(session_replay::upload_segment)
+                    // Overrides the app-wide 64 KB DefaultBodyLimit; segments are up to 5 MB compressed plus error metadata
+                    .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES as usize)),
             );
     } else {
         info!("Session replay endpoints disabled by configuration");
@@ -274,7 +291,7 @@ async fn main() {
             processor,
             metrics_collector,
             validator,
-            s3_service,
+            replay_ctx,
             site_cfg_cache.clone(),
         ))
         .layer(CorsLayer::permissive());
@@ -401,10 +418,10 @@ async fn health_check(
         Arc<EventProcessor>,
         Option<Arc<MetricsCollector>>,
         Arc<EventValidator>,
-        Option<Arc<S3Service>>,
+        Option<Arc<ReplayCtx>>,
         Arc<SiteConfigCache>,
     )>,
-) -> Result<impl IntoResponse, String> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     match db.check_connection().await {
         Ok(_) => Ok(Json(serde_json::json!({
             "status": "ok",
@@ -412,18 +429,21 @@ async fn health_check(
         }))),
         Err(e) => {
             error!("Database health check failed: {}", e);
-            Err(format!("Database connection failed: {}", e))
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Database connection failed: {}", e),
+            ))
         }
     }
 }
 
 async fn track_event(
-    State((_db, processor, metrics, validator, _s3, site_cfg_cache)): State<(
+    State((_db, processor, metrics, validator, _replay_ctx, site_cfg_cache)): State<(
         SharedDatabase,
         Arc<EventProcessor>,
         Option<Arc<MetricsCollector>>,
         Arc<EventValidator>,
-        Option<Arc<S3Service>>,
+        Option<Arc<ReplayCtx>>,
         Arc<SiteConfigCache>,
     )>,
     client: ClientRequest,
@@ -508,7 +528,7 @@ async fn metrics_handler(
         Arc<EventProcessor>,
         Option<Arc<MetricsCollector>>,
         Arc<EventValidator>,
-        Option<Arc<S3Service>>,
+        Option<Arc<ReplayCtx>>,
         Arc<SiteConfigCache>,
     )>,
 ) -> impl IntoResponse {
